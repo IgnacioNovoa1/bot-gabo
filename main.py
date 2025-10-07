@@ -165,6 +165,12 @@ async def tiemporeal(ctx):
         f"🎮 **{game_name}** en curso:\n"
         f"🕒 Tiempo actual: **{hours}h {minutes}min {seconds}s**"
     )
+if os.path.exists("bot.lock"):
+    exit()
+else:
+    open("bot.lock", "w").close()
 
-keep_alive()
 bot.run(TOKEN)
+os.remove("bot.lock")
+keep_alive()
+
