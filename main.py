@@ -131,6 +131,10 @@ async def vertiempo(ctx):
     with open(DATA_FILE, "r") as f:
         data = json.load(f)
 
+    if not data:
+        await ctx.send("📊 Aún no hay registros de Gabo rateando.")
+        return
+
     msg = "🎮 **Tiempo total de Gabo rateando:**\n"
     for game, info in data.items():
         msg += f"- **{game}**: {info['total_time_human']}\n"
