@@ -169,8 +169,8 @@ if os.path.exists("bot.lock"):
     exit()
 else:
     open("bot.lock", "w").close()
-
+keep_alive()
 bot.run(TOKEN)
 os.remove("bot.lock")
-keep_alive()
+
 
