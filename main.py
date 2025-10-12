@@ -3,6 +3,7 @@ from discord.ext import tasks, commands
 import datetime
 import json
 import os
+import signal
 from zoneinfo import ZoneInfo
 from discord.errors import NotFound, HTTPException
 from keep_alive import keep_alive
@@ -12,10 +13,12 @@ import time
 TOKEN = os.environ.get("TOKEN")
 TARGET_USER_ID = 369975308767461378  # <-- ID de Gabo
 TARGET_CHANNEL_NAME = "gabo-persona-5"
-TARGET_GAMES = ["Persona 5", "Persona 5 Royal", "Persona 5 Royale", "Persona 5 Royal Edition", "Persona 3 Reload", "Persona 3 Reloaded"]
+TARGET_GAMES = [
+    "Persona 5", "Persona 5 Royal", "Persona 5 Royale",
+    "Persona 5 Royal Edition", "Persona 3 Reload", "Persona 3 Reloaded"
+]
 DATA_FILE = "gabo_tiempo.json"
 LOCAL_TZ = ZoneInfo("America/Santiago")
-
 
 # === INTENTS ===
 intents = discord.Intents.default()
@@ -25,15 +28,133 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# === VARIABLES ===
-user_game_start = {}
-game_data = {}
+# === VARIABLES EN MEMORIA ===
+user_game_start = {}   # { user_id: {game, start: datetime} }
+game_data = {}         # { game_name: {total_seconds, total_time_human, last_session, ...}, "active_sessions": {user_id: {...}} }
 target_channel = None
 
-# === CARGAR DATOS SI EXISTEN ===
-if os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "r") as f:
-        game_data = json.load(f)
+# ---------- Utilidades de persistencia ----------
+def _now():
+    return datetime.datetime.now(LOCAL_TZ)
+
+def load_data():
+    global game_data
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r") as f:
+                game_data = json.load(f)
+        except Exception:
+            game_data = {}
+    else:
+        game_data = {}
+    # migración: asegurar clave de sesiones activas
+    if "active_sessions" not in game_data or not isinstance(game_data["active_sessions"], dict):
+        game_data["active_sessions"] = {}
+
+def save_data():
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(game_data, f, indent=4)
+    os.replace(tmp, DATA_FILE)
+
+def humanize_total(total_sec: int):
+    hours = total_sec // 3600
+    minutes = (total_sec % 3600) // 60
+    return f"{hours}h {minutes}min", hours, minutes
+
+def start_session_persist(user_id: int, game_name: str, start_dt: datetime.datetime):
+    # guardar estado activo en disco
+    game_data["active_sessions"][str(user_id)] = {
+        "game": game_name,
+        "start": start_dt.isoformat()
+    }
+    save_data()
+
+def end_session_apply(user_id: int, game_name: str, start_dt: datetime.datetime, end_dt: datetime.datetime):
+    # sumar al acumulado y limpiar sesión activa
+    duration = end_dt - start_dt
+    add_sec = int(duration.total_seconds())
+    total_sec = game_data.get(game_name, {}).get("total_seconds", 0) + add_sec
+
+    total_human, hours, minutes = humanize_total(total_sec)
+    game_data[game_name] = {
+        "total_seconds": total_sec,
+        "total_time_human": total_human,
+        "last_session": {
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+            "duration": str(duration)
+        }
+    }
+    game_data["active_sessions"].pop(str(user_id), None)
+    save_data()
+    return duration, hours, minutes
+
+def reconcile_on_boot(guild):
+    """
+    Al iniciar: si hay una sesión activa guardada y Gabo ya NO está jugando,
+    cerramos la sesión usando la hora de arranque como fin.
+    Si SÍ está jugando, mantenemos la sesión abierta (sin cerrar).
+    """
+    if not guild:
+        return
+
+    active = game_data.get("active_sessions", {}).get(str(TARGET_USER_ID))
+    if not active:
+        return
+
+    # Intentar obtener miembro y presencia actual
+    async def _reconcile():
+        nonlocal active
+        try:
+            gabo = guild.get_member(TARGET_USER_ID) or await guild.fetch_member(TARGET_USER_ID)
+        except (NotFound, HTTPException):
+            gabo = None
+
+        # detectar si actualmente está jugando un título válido
+        is_playing_now = False
+        current_game_name = None
+        if gabo and gabo.activities:
+            for activity in gabo.activities:
+                if isinstance(activity, (discord.Game, discord.Activity)):
+                    if activity.name and any(n.lower() in activity.name.lower() for n in TARGET_GAMES):
+                        is_playing_now = True
+                        current_game_name = activity.name
+                        break
+
+        # parsear inicio guardado
+        try:
+            start_dt = datetime.datetime.fromisoformat(active["start"])
+            if start_dt.tzinfo is None:
+                # forzar zona si venía naive
+                start_dt = start_dt.replace(tzinfo=LOCAL_TZ)
+        except Exception:
+            # si hay corrupción, eliminamos sesión activa para no bloquear
+            game_data["active_sessions"].pop(str(TARGET_USER_ID), None)
+            save_data()
+            return
+
+        if is_playing_now:
+            # mantener la sesión abierta y también en RAM para que !tiemporeal funcione
+            user_game_start[TARGET_USER_ID] = {"game": active["game"], "start": start_dt}
+            return
+
+        # No está jugando ahora, cerramos la sesión pendiente hasta ahora
+        end_dt = _now()
+        duration, hours, minutes = end_session_apply(TARGET_USER_ID, active["game"], start_dt, end_dt)
+
+        # intentar anunciar al canal si lo tenemos
+        if target_channel:
+            await target_channel.send(
+                f"⏹️ **Gabo** dejó de ratear en **{active['game']}** (reconciliado tras reinicio).\n"
+                f"🕒 Duración: **{duration}**\n"
+                f"⌛ Total acumulado: **{hours}h {minutes}min**"
+            )
+
+    return _reconcile
+
+# ---------- Cargar datos al importar ----------
+load_data()
 
 # === AL CONECTARSE ===
 @bot.event
@@ -41,11 +162,16 @@ async def on_ready():
     global target_channel
     print(f"✅ Bot conectado como {bot.user}")
 
+    # localizar canal objetivo
     for guild in bot.guilds:
         await guild.chunk()
         channel = discord.utils.find(lambda c: c.name == TARGET_CHANNEL_NAME, guild.text_channels)
         if channel:
             target_channel = channel
+            # reconciliar aquí, por servidor
+            reconcile_coro = reconcile_on_boot(guild)
+            if reconcile_coro:
+                await reconcile_coro()
             break
 
     if not target_channel:
@@ -61,19 +187,17 @@ async def check_gabo_activity():
         return  # No hay canal para enviar mensajes
 
     guild = bot.guilds[0]
-    gabo = guild.get_member(TARGET_USER_ID)
-    now = datetime.datetime.now(LOCAL_TZ)
+    try:
+        gabo = guild.get_member(TARGET_USER_ID) or await guild.fetch_member(TARGET_USER_ID)
+    except (NotFound, HTTPException):
+        print("⚠️ Gabo no fue encontrado.")
+        return
 
-    if not gabo:
-        try:
-            gabo = await guild.fetch_member(TARGET_USER_ID)
-        except (NotFound, HTTPException):
-            print("⚠️ Gabo no fue encontrado.")
-            return
+    now = _now()
 
-    # Buscar si está jugando Persona 5
+    # Buscar si está jugando uno de los títulos
     current_game = None
-    for activity in gabo.activities:
+    for activity in getattr(gabo, "activities", []) or []:
         if isinstance(activity, (discord.Game, discord.Activity)):
             if activity.name and any(name.lower() in activity.name.lower() for name in TARGET_GAMES):
                 current_game = activity.name
@@ -82,38 +206,33 @@ async def check_gabo_activity():
     # === SI ESTÁ JUGANDO ===
     if current_game:
         if gabo.id not in user_game_start:
+            # sesión nueva
             user_game_start[gabo.id] = {"game": current_game, "start": now}
+            start_session_persist(gabo.id, current_game, now)
             print(f"▶️ {gabo.display_name} comenzó a jugar {current_game} a las {now.strftime('%H:%M:%S')}")
             await target_channel.send(f"🔥 **{gabo.display_name}** empezó a ratear en **{current_game}** 🎮🔥")
+        else:
+            # si cambió de juego en caliente, cerramos la anterior y abrimos nueva
+            sess = user_game_start[gabo.id]
+            if sess["game"] != current_game:
+                duration, hours, minutes = end_session_apply(gabo.id, sess["game"], sess["start"], now)
+                await target_channel.send(
+                    f"⏹️ **{gabo.display_name}** dejó de ratear en **{sess['game']}**.\n"
+                    f"🕒 Duración: **{duration}**\n"
+                    f"⌛ Total acumulado: **{hours}h {minutes}min**"
+                )
+                # iniciar nueva
+                user_game_start[gabo.id] = {"game": current_game, "start": now}
+                start_session_persist(gabo.id, current_game, now)
+                await target_channel.send(f"🔥 **{gabo.display_name}** empezó a ratear en **{current_game}** 🎮🔥")
 
     # === SI DEJÓ DE JUGAR ===
     elif gabo.id in user_game_start:
         session = user_game_start.pop(gabo.id)
-        start_time = session["start"]
-        game_name = session["game"]
-        duration = now - start_time
-
-        # Actualizar acumulado
-        total_sec = game_data.get(game_name, {}).get("total_seconds", 0) + int(duration.total_seconds())
-        hours = total_sec // 3600
-        minutes = (total_sec % 3600) // 60
-
-        game_data[game_name] = {
-            "total_seconds": total_sec,
-            "total_time_human": f"{hours}h {minutes}min",
-            "last_session": {
-                "start": start_time.isoformat(),
-                "end": now.isoformat(),
-                "duration": str(duration)
-            }
-        }
-
-        with open(DATA_FILE, "w") as f:
-            json.dump(game_data, f, indent=4)
-
-        print(f"⏹️ {gabo.display_name} dejó de jugar {game_name}. Duración: {duration}")
+        duration, hours, minutes = end_session_apply(gabo.id, session["game"], session["start"], now)
+        print(f"⏹️ {gabo.display_name} dejó de jugar {session['game']}. Duración: {duration}")
         await target_channel.send(
-            f"⏹️ **{gabo.display_name}** dejó de ratear en **{game_name}**.\n"
+            f"⏹️ **{gabo.display_name}** dejó de ratear en **{session['game']}**.\n"
             f"🕒 Duración: **{duration}**\n"
             f"⌛ Total acumulado: **{hours}h {minutes}min**"
         )
@@ -124,28 +243,39 @@ async def vertiempo(ctx):
     if ctx.channel.name != TARGET_CHANNEL_NAME:
         return
 
-    if not os.path.exists(DATA_FILE):
-        await ctx.send("📊 Aún no hay registros de Gabo rateando.")
-        return
+    load_data()  # recargar del disco por si otro proceso tocó el archivo
+    data = game_data.copy()
 
-    with open(DATA_FILE, "r") as f:
-        data = json.load(f)
-
-    if not data:
+    # construir mensaje
+    payload = {k: v for k, v in data.items() if k not in ("active_sessions",)}
+    if not payload:
         await ctx.send("📊 Aún no hay registros de Gabo rateando.")
         return
 
     msg = "🎮 **Tiempo total de Gabo rateando:**\n"
-    for game, info in data.items():
-        msg += f"- **{game}**: {info['total_time_human']}\n"
+    for game, info in payload.items():
+        if isinstance(info, dict) and "total_time_human" in info:
+            msg += f"- **{game}**: {info['total_time_human']}\n"
 
     await ctx.send(msg)
-    
+
 # === COMANDO: !tiemporeal ===
 @bot.command()
 async def tiemporeal(ctx):
     if ctx.channel.name != TARGET_CHANNEL_NAME:
         return
+
+    if TARGET_USER_ID not in user_game_start:
+        # si el proceso se reinició, intentar levantar desde JSON
+        active = game_data.get("active_sessions", {}).get(str(TARGET_USER_ID))
+        if active:
+            try:
+                start_dt = datetime.datetime.fromisoformat(active["start"])
+                if start_dt.tzinfo is None:
+                    start_dt = start_dt.replace(tzinfo=LOCAL_TZ)
+                user_game_start[TARGET_USER_ID] = {"game": active["game"], "start": start_dt}
+            except Exception:
+                pass
 
     if TARGET_USER_ID not in user_game_start:
         await ctx.send("⏳ Gabo no está rateando en este momento.")
@@ -154,7 +284,7 @@ async def tiemporeal(ctx):
     session = user_game_start[TARGET_USER_ID]
     start_time = session["start"]
     game_name = session["game"]
-    now = datetime.datetime.now(LOCAL_TZ)
+    now = _now()
     duration = now - start_time
 
     hours = duration.seconds // 3600
@@ -165,12 +295,43 @@ async def tiemporeal(ctx):
         f"🎮 **{game_name}** en curso:\n"
         f"🕒 Tiempo actual: **{hours}h {minutes}min {seconds}s**"
     )
+
+# ---------- Señales para guardado seguro ----------
+def handle_shutdown(signum, frame):
+    # guardamos la sesión activa en JSON si aún no está reflejada
+    for uid, sess in user_game_start.items():
+        # asegurar que active_sessions tenga esta sesión
+        if str(uid) not in game_data.get("active_sessions", {}):
+            game_data["active_sessions"][str(uid)] = {
+                "game": sess["game"],
+                "start": sess["start"].isoformat()
+            }
+    save_data()
+    try:
+        os.remove("bot.lock")
+    except FileNotFoundError:
+        pass
+    # salida limpia
+    os._exit(0)
+
+signal.signal(signal.SIGTERM, handle_shutdown)
+signal.signal(signal.SIGINT, handle_shutdown)
+
+# ---------- Guardián de instancia ----------
 if os.path.exists("bot.lock"):
+    # otra instancia en curso
     exit()
 else:
     open("bot.lock", "w").close()
+
+# Servicio web keep-alive (opcional en Render)
 keep_alive()
+
+# Run bot
 bot.run(TOKEN)
-os.remove("bot.lock")
 
-
+# limpieza al salir "normal"
+try:
+    os.remove("bot.lock")
+except FileNotFoundError:
+    pass
