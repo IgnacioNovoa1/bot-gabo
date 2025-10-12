@@ -68,16 +68,30 @@ def start_session_persist(user_id: int, game_name: str, start_dt: datetime.datet
         "game": game_name,
         "start": start_dt.isoformat()
     }
+    # inicializa contenedores del juego si no existen
+    if game_name not in game_data or not isinstance(game_data.get(game_name), dict):
+        game_data[game_name] = {"total_seconds": 0, "total_time_human": "0h 0min"}
     save_data()
+
+def _clear_live_fields(game_name: str):
+    # limpia los campos live_* si existen
+    if game_name in game_data and isinstance(game_data[game_name], dict):
+        game_data[game_name].pop("live_total_seconds", None)
+        game_data[game_name].pop("live_total_time_human", None)
+        game_data[game_name].pop("live_updated_at", None)
 
 def end_session_apply(user_id: int, game_name: str, start_dt: datetime.datetime, end_dt: datetime.datetime):
     # sumar al acumulado y limpiar sesión activa
     duration = end_dt - start_dt
     add_sec = int(duration.total_seconds())
-    total_sec = game_data.get(game_name, {}).get("total_seconds", 0) + add_sec
+    base_total = 0
+    if isinstance(game_data.get(game_name), dict):
+        base_total = int(game_data.get(game_name, {}).get("total_seconds", 0))
 
+    total_sec = base_total + add_sec
     total_human, hours, minutes = humanize_total(total_sec)
     game_data[game_name] = {
+        **game_data.get(game_name, {}),
         "total_seconds": total_sec,
         "total_time_human": total_human,
         "last_session": {
@@ -86,6 +100,7 @@ def end_session_apply(user_id: int, game_name: str, start_dt: datetime.datetime,
             "duration": str(duration)
         }
     }
+    _clear_live_fields(game_name)
     game_data["active_sessions"].pop(str(user_id), None)
     save_data()
     return duration, hours, minutes
@@ -103,7 +118,6 @@ def reconcile_on_boot(guild):
     if not active:
         return
 
-    # Intentar obtener miembro y presencia actual
     async def _reconcile():
         nonlocal active
         try:
@@ -126,16 +140,14 @@ def reconcile_on_boot(guild):
         try:
             start_dt = datetime.datetime.fromisoformat(active["start"])
             if start_dt.tzinfo is None:
-                # forzar zona si venía naive
                 start_dt = start_dt.replace(tzinfo=LOCAL_TZ)
         except Exception:
-            # si hay corrupción, eliminamos sesión activa para no bloquear
             game_data["active_sessions"].pop(str(TARGET_USER_ID), None)
             save_data()
             return
 
         if is_playing_now:
-            # mantener la sesión abierta y también en RAM para que !tiemporeal funcione
+            # mantener la sesión abierta y también en RAM
             user_game_start[TARGET_USER_ID] = {"game": active["game"], "start": start_dt}
             return
 
@@ -143,7 +155,6 @@ def reconcile_on_boot(guild):
         end_dt = _now()
         duration, hours, minutes = end_session_apply(TARGET_USER_ID, active["game"], start_dt, end_dt)
 
-        # intentar anunciar al canal si lo tenemos
         if target_channel:
             await target_channel.send(
                 f"⏹️ **Gabo** dejó de ratear en **{active['game']}** (reconciliado tras reinicio).\n"
@@ -179,6 +190,7 @@ async def on_ready():
     else:
         print(f"✅ Canal objetivo detectado: #{target_channel.name}")
         check_gabo_activity.start()
+        flush_live_json.start()  # <-- arranca el refresco periódico del JSON
 
 # === LOOP DE DETECCIÓN ===
 @tasks.loop(seconds=15)
@@ -237,6 +249,46 @@ async def check_gabo_activity():
             f"⌛ Total acumulado: **{hours}h {minutes}min**"
         )
 
+# === LOOP: refresco periódico del JSON con totales "en vivo" ===
+@tasks.loop(seconds=60)
+async def flush_live_json():
+    now = _now()
+    active_map = game_data.get("active_sessions", {})
+    changed = False
+
+    for uid_str, sess in list(active_map.items()):
+        game = sess.get("game")
+        start_iso = sess.get("start")
+        if not game or not start_iso:
+            continue
+        try:
+            start_dt = datetime.datetime.fromisoformat(start_iso)
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=LOCAL_TZ)
+        except Exception:
+            continue
+
+        elapsed = int((now - start_dt).total_seconds())
+        base_total = int(game_data.get(game, {}).get("total_seconds", 0))
+        live_total = max(0, base_total + elapsed)
+        live_human, _, _ = humanize_total(live_total)
+
+        if game not in game_data or not isinstance(game_data.get(game), dict):
+            game_data[game] = {}
+
+        # Solo marcamos cambios si algo efectivamente cambió
+        prev_live = game_data[game].get("live_total_seconds")
+        if prev_live != live_total:
+            game_data[game]["live_total_seconds"] = live_total
+            game_data[game]["live_total_time_human"] = live_human
+            game_data[game]["live_updated_at"] = now.isoformat()
+            changed = True
+
+    # Si no hay sesiones activas, opcionalmente podríamos limpiar live_* de todos los juegos
+    # pero lo dejamos persistente hasta el próximo cierre.
+    if changed:
+        save_data()
+
 # === COMANDO: !vertiempo ===
 @bot.command()
 async def vertiempo(ctx):
@@ -254,8 +306,10 @@ async def vertiempo(ctx):
 
     msg = "🎮 **Tiempo total de Gabo rateando:**\n"
     for game, info in payload.items():
-        if isinstance(info, dict) and "total_time_human" in info:
-            msg += f"- **{game}**: {info['total_time_human']}\n"
+        if isinstance(info, dict):
+            human = info.get("live_total_time_human") or info.get("total_time_human")
+            if human:
+                msg += f"- **{game}**: {human}\n"
 
     await ctx.send(msg)
 
@@ -287,9 +341,11 @@ async def tiemporeal(ctx):
     now = _now()
     duration = now - start_time
 
-    hours = duration.seconds // 3600
-    minutes = (duration.seconds % 3600) // 60
-    seconds = duration.seconds % 60
+    # cuidado: duration.total_seconds() incluye días
+    total_secs = int(duration.total_seconds())
+    hours = total_secs // 3600
+    minutes = (total_secs % 3600) // 60
+    seconds = total_secs % 60
 
     await ctx.send(
         f"🎮 **{game_name}** en curso:\n"
@@ -300,7 +356,6 @@ async def tiemporeal(ctx):
 def handle_shutdown(signum, frame):
     # guardamos la sesión activa en JSON si aún no está reflejada
     for uid, sess in user_game_start.items():
-        # asegurar que active_sessions tenga esta sesión
         if str(uid) not in game_data.get("active_sessions", {}):
             game_data["active_sessions"][str(uid)] = {
                 "game": sess["game"],
@@ -311,7 +366,6 @@ def handle_shutdown(signum, frame):
         os.remove("bot.lock")
     except FileNotFoundError:
         pass
-    # salida limpia
     os._exit(0)
 
 signal.signal(signal.SIGTERM, handle_shutdown)
@@ -319,7 +373,6 @@ signal.signal(signal.SIGINT, handle_shutdown)
 
 # ---------- Guardián de instancia ----------
 if os.path.exists("bot.lock"):
-    # otra instancia en curso
     exit()
 else:
     open("bot.lock", "w").close()
