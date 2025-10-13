@@ -15,7 +15,7 @@ TARGET_USER_ID = 369975308767461378  # <-- ID de Gabo
 TARGET_CHANNEL_NAME = "gabo-persona-5"
 TARGET_GAMES = [
     "Persona 5", "Persona 5 Royal", "Persona 5 Royale",
-    "Persona 5 Royal Edition", "Persona 3 Reload", "Persona 3 Reloaded", "Hollow Knight: Silksong", "Hollow Knight", "League Of Legends"
+    "Persona 5 Royal Edition", "Persona 3 Reload", "Persona 3 Reloaded", "Hollow Knight: Silksong", "Hollow Knight"
 ]
 DATA_FILE = "gabo_tiempo.json"
 LOCAL_TZ = ZoneInfo("America/Santiago")
