@@ -7,5 +7,10 @@
             "end": "2025-10-07T01:48:17.907225-03:00",
             "duration": "2:39:00.010436"
         }
-    }
+    },
+    "Hollow Knight: Silksong": {
+        "total_seconds": 19080,
+        "total_time_human": "5h 18min"
+    },
+    "active_sessions": {}
 }
