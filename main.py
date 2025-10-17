@@ -125,6 +125,14 @@ async def on_ready():
         print(f"✅ Canal objetivo detectado: #{target_channel.name}")
         check_gabo_activity.start()
         flush_live_json.start()
+        heart_beat.start() # <-- ¡NUEVA LÍNEA CLAVE!
+
+# === TAREAS EN LOOP ===
+
+@tasks.loop(seconds=30) # <-- Tarea para asegurar actividad constante en Render
+async def heart_beat():
+    # Solo imprime un mensaje para mantener el proceso "vivo" y activo.
+    print(f"❤️ HeartBeat: Proceso activo. {_now().strftime('%H:%M:%S')}")
 
 
 @tasks.loop(seconds=15)
@@ -198,6 +206,7 @@ async def flush_live_json():
     if changed:
         save_data()
 
+# === COMANDOS ===
 
 @bot.command(aliases=["horas", "tiempos"])
 async def vertiempo(ctx):
